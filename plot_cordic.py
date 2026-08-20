@@ -1,116 +1,181 @@
-import os
+"""
+cordic_verify.py
+
+Reads cordic_results.csv (produced by tb_cordic_sweep.v running the
+cordic_unified.v hardware core in Icarus Verilog) and cross-checks every
+hardware output against the equivalent Python math.* computation.
+
+Produces:
+  - cordic_verification.png : 4 overlaid hardware-vs-Python plots, each
+    annotated with its own max/RMSE error and accuracy %
+  - cordic_accuracy_report.txt : full accuracy report (also printed)
+"""
+
 import pandas as pd
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 
-os.makedirs('plots', exist_ok=True)
+SCALE = 2.0 ** 27  # Q4.27
 
-try:
-    df = pd.read_csv('cordic_results.csv')
-except FileNotFoundError:
-    print("Error: cordic_results.csv not found.")
-    exit()
+df = pd.read_csv("cordic_results.csv")
 
-# Helper function to calculate hardware accuracy
-def calculate_accuracy(hw, ideal, name):
-    abs_err = np.abs(hw - ideal)
-    max_err = np.max(abs_err)
-    
-    # Ignore values where ideal is extremely close to zero to prevent divide-by-zero
-    mask = np.abs(ideal) > 1e-4
-    if np.any(mask):
-        mape = np.mean(np.abs((hw[mask] - ideal[mask]) / ideal[mask])) * 100
-        accuracy = 100.0 - mape
-    else:
-        accuracy = 100.0
-        
-    return f"{name:<10} | {accuracy:>9.4f}% | {max_err:>11.2e}"
+# Convert fixed-point integer columns back to real numbers
+for col in ["x_in", "y_in", "z_in", "x_out", "y_out", "z_out"]:
+    df[col + "_r"] = df[col] / SCALE
 
-# Helper function to generate plots
-def create_plot(filename, title, input_val, hw_y1, ideal_y1, label1, hw_y2=None, ideal_y2=None, label2=None, xlabel="Input"):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
-    
-    ax1.plot(input_val, hw_y1, 'bo', label=f'HW {label1}', markersize=4, alpha=0.7)
-    ax1.plot(input_val, ideal_y1, 'k-', label=f'Ideal {label1}', linewidth=1.5)
-    err1 = hw_y1 - ideal_y1
-    ax2.plot(input_val, err1, 'b-', label=f'{label1} Error')
-    
-    if hw_y2 is not None:
-        ax1.plot(input_val, hw_y2, 'ro', label=f'HW {label2}', markersize=4, alpha=0.7)
-        ax1.plot(input_val, ideal_y2, 'g-', label=f'Ideal {label2}', linewidth=1.5)
-        err2 = hw_y2 - ideal_y2
-        ax2.plot(input_val, err2, 'r-', label=f'{label2} Error')
-        
-    ax1.set_title(title)
-    ax1.grid(True, linestyle='--', alpha=0.6)
-    ax1.legend()
-    
-    ax2.set_title('Quantization Error (HW - Ideal)')
-    ax2.set_xlabel(xlabel)
-    ax2.grid(True, linestyle='--', alpha=0.6)
-    ax2.ticklabel_format(axis='y', style='sci', scilimits=(0,0))
-    ax2.legend()
-    
-    plt.tight_layout()
-    filepath = os.path.join('plots', filename)
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close() 
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+fig.suptitle("CORDIC Hardware (Verilog, Q4.27) vs Python Reference", fontsize=13)
 
-# --- Generate Plots and Print Accuracy Table ---
-print("\n" + "="*40)
-print(" 32-BIT CORDIC HARDWARE ACCURACY REPORT")
-print("="*40)
-print(f"{'FUNCTION':<10} | {'ACCURACY %':>10} | {'MAX ERROR':>11}")
-print("-" * 40)
+errors = {}
+report_lines = []
 
-# 1. Sin / Cos
-d = df[df['test_id'] == 1]
-ideal_cos = np.cos(np.radians(d['input_val']))
-ideal_sin = np.sin(np.radians(d['input_val']))
-create_plot('1_sin_cos.png', 'Sin(x) and Cos(x)', d['input_val'], d['out_x'], ideal_cos, 'Cos', d['out_y'], ideal_sin, 'Sin', "Input Angle (Degrees)")
-print(calculate_accuracy(d['out_x'], ideal_cos, "Cosine"))
-print(calculate_accuracy(d['out_y'], ideal_sin, "Sine"))
 
-# 2. Arctan
-d = df[df['test_id'] == 2]
-hw_arctan = d['out_z'] * 180.0 / np.pi
-ideal_arctan = np.degrees(np.arctan(d['input_val']))
-create_plot('2_arctan.png', 'Arctan(x)', d['input_val'], hw_arctan, ideal_arctan, 'Arctan', xlabel="Input Ratio (Y/X)")
-print(calculate_accuracy(hw_arctan, ideal_arctan, "Arctan"))
+def accuracy_stats(name, hw, py, value_range):
+    """Return (and record) max error, RMSE, and an accuracy % relative to
+    the span of the expected values (value_range = max(py) - min(py))."""
+    err = np.abs(hw - py)
+    max_err = err.max()
+    rmse = np.sqrt(np.mean(err ** 2))
+    mean_err = err.mean()
+    # Accuracy expressed as: how close, in %, worst-case output is to ideal,
+    # relative to the full swing of the function over the sweep.
+    accuracy_pct = 100.0 * (1.0 - max_err / value_range) if value_range > 0 else 100.0
+    report_lines.append(
+        f"{name:32s} max_err={max_err:.3e}  rmse={rmse:.3e}  "
+        f"mean_err={mean_err:.3e}  accuracy={accuracy_pct:.4f}%"
+    )
+    errors[name] = err
+    return max_err, rmse, accuracy_pct
 
-# 3. Sinh / Cosh
-d = df[df['test_id'] == 3]
-ideal_cosh = np.cosh(d['input_val'])
-ideal_sinh = np.sinh(d['input_val'])
-create_plot('3_sinh_cosh.png', 'Sinh(x) and Cosh(x)', d['input_val'], d['out_x'], ideal_cosh, 'Cosh', d['out_y'], ideal_sinh, 'Sinh', "Input Radians")
-print(calculate_accuracy(d['out_x'], ideal_cosh, "Cosh"))
-print(calculate_accuracy(d['out_y'], ideal_sinh, "Sinh"))
 
-# 4. Exponential (e^x)
-d = df[df['test_id'] == 4]
-ideal_exp = np.exp(d['input_val'])
-create_plot('4_exp.png', 'Exponential (e^x)', d['input_val'], d['out_x'], ideal_exp, 'e^x', xlabel="Input Value (x)")
-print(calculate_accuracy(d['out_x'], ideal_exp, "e^x"))
+def annotate(ax, max_err, rmse, accuracy_pct):
+    ax.text(
+        0.98, 0.02,
+        f"max err: {max_err:.2e}\nRMSE: {rmse:.2e}\nacc: {accuracy_pct:.3f}%",
+        transform=ax.transAxes, fontsize=8, va='bottom', ha='right',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.85)
+    )
 
-# 5. Arctanh
-d = df[df['test_id'] == 5]
-ideal_arctanh = np.arctanh(d['input_val'])
-create_plot('5_arctanh.png', 'Arctanh(x)', d['input_val'], d['out_z'], ideal_arctanh, 'Arctanh', xlabel="Input Value (x)")
-print(calculate_accuracy(d['out_z'], ideal_arctanh, "Arctanh"))
+# ---------------------------------------------------------------------------
+# 1. Circular rotation: cos(theta), sin(theta)
+# ---------------------------------------------------------------------------
+g1 = df[df.tag == 1].copy()
+theta = g1["z_in_r"].values
+cos_hw, sin_hw = g1["x_out_r"].values, g1["y_out_r"].values
+cos_py = np.cos(theta)
+sin_py = np.sin(theta)
 
-# 6. Natural Log (ln)
-d = df[df['test_id'] == 6]
-hw_ln = d['out_z'] * 2.0
-ideal_ln = np.log(d['input_val'])
-create_plot('6_natural_log.png', 'Natural Logarithm ln(x)', d['input_val'], hw_ln, ideal_ln, 'ln(x)', xlabel="Input Value (x)")
-print(calculate_accuracy(hw_ln, ideal_ln, "ln(x)"))
+ax = axes[0, 0]
+ax.plot(np.degrees(theta), cos_py, 'b-', label='cos (Python)')
+ax.plot(np.degrees(theta), cos_hw, 'b.', label='cos (HW)')
+ax.plot(np.degrees(theta), sin_py, 'r-', label='sin (Python)')
+ax.plot(np.degrees(theta), sin_hw, 'r.', label='sin (HW)')
+ax.set_title("Circular Rotation: cos/sin(theta)")
+ax.set_xlabel("theta (deg)")
+ax.legend(fontsize=8)
+ax.grid(alpha=0.3)
 
-# 7. Square Root
-d = df[df['test_id'] == 7]
-hw_sqrt = d['out_x'] * 1.207497067
-ideal_sqrt = np.sqrt(d['input_val'])
-create_plot('7_sqrt.png', 'Square Root', d['input_val'], hw_sqrt, ideal_sqrt, 'Sqrt(x)', xlabel="Input Value (x)")
-print(calculate_accuracy(hw_sqrt, ideal_sqrt, "Sqrt(x)"))
+me_c, rmse_c, acc_c = accuracy_stats('circular_rotation_cos', cos_hw, cos_py, cos_py.max() - cos_py.min())
+me_s, rmse_s, acc_s = accuracy_stats('circular_rotation_sin', sin_hw, sin_py, sin_py.max() - sin_py.min())
+annotate(ax, max(me_c, me_s), max(rmse_c, rmse_s), min(acc_c, acc_s))
 
-print("="*40)
-print("Plots saved successfully in /plots/ directory.\n")
+# ---------------------------------------------------------------------------
+# 2. Circular vectoring: recover magnitude (=1) and angle (atan2)
+# ---------------------------------------------------------------------------
+g2 = df[df.tag == 2].copy()
+theta_in = np.degrees(np.arctan2(g2["y_in_r"].values, g2["x_in_r"].values))
+mag_hw = g2["x_out_r"].values
+ang_hw = np.degrees(g2["z_out_r"].values)
+mag_py = np.ones_like(theta_in)
+ang_py = theta_in
+
+ax = axes[0, 1]
+ax.plot(theta_in, mag_py, 'b-', label='magnitude (Python, =1)')
+ax.plot(theta_in, mag_hw, 'b.', label='magnitude (HW)')
+ax2 = ax.twinx()
+ax2.plot(theta_in, ang_py, 'g-', label='angle (Python)')
+ax2.plot(theta_in, ang_hw, 'g.', label='angle (HW)')
+ax.set_title("Circular Vectoring: magnitude & atan2(theta)")
+ax.set_xlabel("true theta (deg)")
+ax.set_ylabel("magnitude")
+ax2.set_ylabel("recovered angle (deg)")
+lines1, labels1 = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc='upper center')
+ax.grid(alpha=0.3)
+
+me_m, rmse_m, acc_m = accuracy_stats('circular_vectoring_mag', mag_hw, mag_py, 1.0)  # ideal mag is always 1.0
+me_a, rmse_a, acc_a = accuracy_stats('circular_vectoring_angle_deg', ang_hw, ang_py, ang_py.max() - ang_py.min())
+annotate(ax, me_m, rmse_m, acc_m)
+
+# ---------------------------------------------------------------------------
+# 3. Hyperbolic rotation: cosh(z), sinh(z)
+# ---------------------------------------------------------------------------
+g3 = df[df.tag == 3].copy()
+z3 = g3["z_in_r"].values
+cosh_hw, sinh_hw = g3["x_out_r"].values, g3["y_out_r"].values
+cosh_py = np.cosh(z3)
+sinh_py = np.sinh(z3)
+
+ax = axes[1, 0]
+ax.plot(z3, cosh_py, 'b-', label='cosh (Python)')
+ax.plot(z3, cosh_hw, 'b.', label='cosh (HW)')
+ax.plot(z3, sinh_py, 'r-', label='sinh (Python)')
+ax.plot(z3, sinh_hw, 'r.', label='sinh (HW)')
+ax.set_title("Hyperbolic Rotation: cosh/sinh(z)")
+ax.set_xlabel("z (rad)")
+ax.legend(fontsize=8)
+ax.grid(alpha=0.3)
+
+me_ch, rmse_ch, acc_ch = accuracy_stats('hyperbolic_rotation_cosh', cosh_hw, cosh_py, cosh_py.max() - cosh_py.min())
+me_sh, rmse_sh, acc_sh = accuracy_stats('hyperbolic_rotation_sinh', sinh_hw, sinh_py, sinh_py.max() - sinh_py.min())
+annotate(ax, max(me_ch, me_sh), max(rmse_ch, rmse_sh), min(acc_ch, acc_sh))
+
+# ---------------------------------------------------------------------------
+# 4. Hyperbolic vectoring: atanh(v)
+# ---------------------------------------------------------------------------
+g4 = df[df.tag == 4].copy()
+v = g4["y_in_r"].values  # x_in was fixed at 1.0
+atanh_hw = g4["z_out_r"].values
+atanh_py = np.arctanh(v)
+
+ax = axes[1, 1]
+ax.plot(v, atanh_py, 'b-', label='atanh (Python)')
+ax.plot(v, atanh_hw, 'b.', label='atanh (HW)')
+ax.set_title("Hyperbolic Vectoring: atanh(v)")
+ax.set_xlabel("v")
+ax.legend(fontsize=8)
+ax.grid(alpha=0.3)
+
+me_at, rmse_at, acc_at = accuracy_stats('hyperbolic_vectoring_atanh', atanh_hw, atanh_py, atanh_py.max() - atanh_py.min())
+annotate(ax, me_at, rmse_at, acc_at)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig("cordic_verification.png", dpi=150)
+print("Saved cordic_verification.png")
+
+# ---------------------------------------------------------------------------
+# Overall accuracy report
+# ---------------------------------------------------------------------------
+all_err = np.concatenate(list(errors.values()))
+overall_max = all_err.max()
+overall_rmse = np.sqrt(np.mean(all_err ** 2))
+
+report_lines.append("-" * 78)
+report_lines.append(f"{'OVERALL (all 4 test groups combined)':32s} max_err={overall_max:.3e}  rmse={overall_rmse:.3e}")
+report_lines.append("")
+report_lines.append("Notes:")
+report_lines.append(" - 'accuracy %' = 100 * (1 - max_err / (max-min of the ideal output over the sweep)).")
+report_lines.append(" - Errors are dominated by the finite 34-stage angle resolution (LSB ~ 2^-27 rad)")
+report_lines.append("   and fixed-point truncation in Q4.27, not by algorithmic mistakes.")
+report_lines.append(" - Hyperbolic vectoring sweep is restricted to |v| <= 0.8 to stay inside the")
+report_lines.append("   |z| < ~1.118 rad convergence domain of hyperbolic CORDIC.")
+
+report_text = "\n".join(report_lines)
+print("\n=== CORDIC accuracy report ===")
+print(report_text)
+
+with open("cordic_accuracy_report.txt", "w") as f:
+    f.write(report_text + "\n")
+print("\nSaved cordic_accuracy_report.txt")

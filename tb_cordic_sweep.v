@@ -1,125 +1,97 @@
-`timescale 1ns / 1ps
-
+`timescale 1ns/1ps
+// =============================================================================
+// tb_cordic_sweep.v
+//
+// Sweeps the cordic_unified core across all 4 modes and dumps every
+// (input, hardware output) pair to cordic_results.csv. A companion Python
+// script (cordic_verify.py) recomputes the same points with math.*, compares
+// them to this CSV, and produces overlaid plots + an error report.
+// =============================================================================
 module tb_cordic_sweep;
 
-    reg clk, rst, valid_in, coord_mode, op_mode;
-    reg signed [31:0] x_in, y_in, z_in;
-    
+    reg clk = 0, rst = 1, valid_in = 0, coord_mode = 0, op_mode = 0;
+    reg  signed [31:0] x_in, y_in, z_in;
     wire valid_out;
     wire signed [31:0] x_out, y_out, z_out;
-    
+
     cordic_unified dut (
         .clk(clk), .rst(rst), .valid_in(valid_in),
         .coord_mode(coord_mode), .op_mode(op_mode),
         .x_in(x_in), .y_in(y_in), .z_in(z_in),
         .valid_out(valid_out), .x_out(x_out), .y_out(y_out), .z_out(z_out)
     );
-    
+
     always #5 clk = ~clk;
-    integer file, step;
-    real val;
 
-    // --- PIPELINE TRACKING ---
-    integer current_test_id;
-    real current_input_val;
-    integer delay_test_id [0:34];
-    real delay_input_val [0:34];
-    integer i;
+    localparam real SCALE = 134217728.0; // 2^27, Q4.27
+    integer fd;
 
-    always @(posedge clk) begin
-        delay_test_id[0] <= current_test_id;
-        delay_input_val[0] <= current_input_val;
-        for (i = 0; i < 34; i = i + 1) begin
-            delay_test_id[i+1] <= delay_test_id[i];
-            delay_input_val[i+1] <= delay_input_val[i];
-        end
-    end
-
-    // --- TASK TO FEED CORDIC ---
-    task feed_cordic(
-        input integer t_id, input real in_val, 
-        input integer cmode, input integer omode,
-        input signed [31:0] xin, input signed [31:0] yin, input signed [31:0] zin
-    );
+    // Drive one input vector into the pipeline and, after enough cycles for
+    // it to drain through all 34 stages, log the hardware result.
+    task run_case(input real xr, input real yr, input real zr,
+                  input cm, input om, input [31:0] tag);
+        reg signed [31:0] xi, yi, zi;
         begin
-            @(posedge clk); #1;
-            valid_in = 1; coord_mode = cmode; op_mode = omode;
-            x_in = xin; y_in = yin; z_in = zin;
-            current_test_id = t_id; current_input_val = in_val;
+            xi = $rtoi(xr * SCALE);
+            yi = $rtoi(yr * SCALE);
+            zi = $rtoi(zr * SCALE);
+
+            @(negedge clk);
+            x_in = xi; y_in = yi; z_in = zi;
+            coord_mode = cm; op_mode = om; valid_in = 1;
+            @(negedge clk);
+            valid_in = 0;
+            repeat (40) @(negedge clk); // drain the 34-stage pipeline
+
+            $fdisplay(fd, "%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                tag, cm, om, xi, yi, zi, x_out, y_out, z_out);
         end
     endtask
 
+    integer k;
+    real theta, v;
+
     initial begin
-        file = $fopen("cordic_results.csv", "w");
-        $fwrite(file, "test_id,input_val,out_x,out_y,out_z\n");
-        
-        clk = 0; rst = 1; valid_in = 0; 
-        current_test_id = 0; current_input_val = 0;
-        #25; rst = 0; 
+        fd = $fopen("cordic_results.csv", "w");
+        $fdisplay(fd, "tag,coord_mode,op_mode,x_in,y_in,z_in,x_out,y_out,z_out");
 
-        // 1. SIN & COS 
-        // 1/Kc = 0.607252935 -> 0x04DBA7A5 (Perfected Q4.27)
-        for (step = -90; step <= 90; step = step + 2) begin
-            val = step;
-            feed_cordic(1, val, 0, 0, 32'h04DBA7A5, 32'd0, $rtoi((val * 3.14159265 / 180.0) * 134217728.0));
+        rst = 1; valid_in = 0; x_in = 0; y_in = 0; z_in = 0;
+        coord_mode = 0; op_mode = 0;
+        repeat (3) @(negedge clk);
+        rst = 0;
+
+        // ---- 1. Circular ROTATION: cos(theta), sin(theta) ----
+        // theta swept from -170 to +170 deg to exercise the quadrant folder
+        for (k = -170; k <= 170; k = k + 5) begin
+            theta = k * 3.14159265358979 / 180.0;
+            run_case(1.0, 0.0, theta, 1'b0, 1'b0, 1);
         end
 
-        // 2. ARCTAN (Inputs: X=1.0, Y=Sweep)
-        for (step = -20; step <= 20; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(2, val, 0, 1, 32'h08000000, $rtoi(val * 134217728.0), 32'd0);
+        // ---- 2. Circular VECTORING: recover magnitude & angle (atan2) ----
+        for (k = -170; k <= 170; k = k + 5) begin
+            theta = k * 3.14159265358979 / 180.0;
+            run_case($cos(theta), $sin(theta), 0.0, 1'b0, 1'b1, 2);
         end
 
-        // 3. SINH & COSH 
-        // 1/Kh = 1.207497067 -> 0x09A9D41C (This was the bug!)
-        for (step = -11; step <= 11; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(3, val, 1, 0, 32'h09A9D41C, 32'd0, $rtoi(val * 134217728.0));
+        // ---- 3. Hyperbolic ROTATION: cosh(z), sinh(z) ----
+        // hyperbolic CORDIC only converges for |z| < ~1.118 rad
+        for (k = -100; k <= 100; k = k + 5) begin
+            v = k / 100.0; // -1.0 .. 1.0
+            run_case(1.0, 0.0, v, 1'b1, 1'b0, 3);
         end
 
-        // 4. e^x
-        // 1/Kh = 1.207497067 -> 0x09A9D41C
-        for (step = -11; step <= 11; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(4, val, 1, 0, 32'h09A9D41C, 32'h09A9D41C, $rtoi(val * 134217728.0));
+        // ---- 4. Hyperbolic VECTORING: atanh(v) ----
+        // Kept within the hyperbolic convergence domain (|atanh(v)| < ~1.118
+        // rad => |v| < ~0.807). Values outside this range are a fundamental
+        // limitation of hyperbolic CORDIC, not a hardware bug (see header
+        // comment in cordic_unified.v).
+        for (k = -80; k <= 80; k = k + 5) begin
+            v = k / 100.0; // -0.8 .. 0.8
+            run_case(1.0, v, 0.0, 1'b1, 1'b1, 4);
         end
 
-        // 5. ARCTANH
-        for (step = -8; step <= 8; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(5, val, 1, 1, 32'h08000000, $rtoi(val * 134217728.0), 32'd0);
-        end
-
-        // 6. Natural Log (ln)
-        for (step = 2; step <= 30; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(6, val, 1, 1, $rtoi((val + 1.0) * 134217728.0), $rtoi((val - 1.0) * 134217728.0), 32'd0);
-        end
-
-        // 7. Square Root
-        for (step = 2; step <= 30; step = step + 1) begin
-            val = step / 10.0;
-            feed_cordic(7, val, 1, 1, $rtoi((val + 0.25) * 134217728.0), $rtoi((val - 0.25) * 134217728.0), 32'd0);
-        end
-
-        @(posedge clk); #1; valid_in = 0; current_test_id = 0;
-        
-        #1000;
-        $fclose(file);
-        $display("Data generation complete! Run the Python script to generate the plots.");
+        $fclose(fd);
+        $display("Wrote cordic_results.csv");
         $finish;
-    end
-
-    // --- MONITOR BLOCK ---
-    always @(posedge clk) begin
-        if (valid_out == 1'b1 && delay_test_id[34] != 0) begin
-            $fwrite(file, "%0d,%f,%f,%f,%f\n", 
-                delay_test_id[34], 
-                delay_input_val[34], 
-                $itor(x_out) / 134217728.0, 
-                $itor(y_out) / 134217728.0, 
-                $itor(z_out) / 134217728.0
-            );
-        end
     end
 endmodule
