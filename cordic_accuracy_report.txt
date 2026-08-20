@@ -1,0 +1,16 @@
+circular_rotation_cos            max_err=1.482e-05  rmse=7.642e-06  mean_err=6.518e-06  accuracy=99.9993%
+circular_rotation_sin            max_err=1.480e-05  rmse=7.164e-06  mean_err=6.024e-06  accuracy=99.9993%
+circular_vectoring_mag           max_err=1.043e-07  rmse=6.836e-08  mean_err=6.263e-08  accuracy=100.0000%
+circular_vectoring_angle_deg     max_err=8.783e-04  rmse=5.994e-04  mean_err=5.611e-04  accuracy=99.9997%
+hyperbolic_rotation_cosh         max_err=3.813e-05  rmse=2.612e-05  mean_err=2.488e-05  accuracy=99.9930%
+hyperbolic_rotation_sinh         max_err=1.367e-04  rmse=8.545e-05  mean_err=7.567e-05  accuracy=99.9942%
+hyperbolic_vectoring_atanh       max_err=1.342e-04  rmse=8.767e-05  mean_err=7.545e-05  accuracy=99.9939%
+------------------------------------------------------------------------------
+OVERALL (all 4 test groups combined) max_err=8.783e-04  rmse=2.548e-04
+
+Notes:
+ - 'accuracy %' = 100 * (1 - max_err / (max-min of the ideal output over the sweep)).
+ - Errors are dominated by the finite 34-stage angle resolution (LSB ~ 2^-27 rad)
+   and fixed-point truncation in Q4.27, not by algorithmic mistakes.
+ - Hyperbolic vectoring sweep is restricted to |v| <= 0.8 to stay inside the
+   |z| < ~1.118 rad convergence domain of hyperbolic CORDIC.
